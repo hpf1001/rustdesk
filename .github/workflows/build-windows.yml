@@ -72,6 +72,7 @@ jobs:
           channel: "stable"
           flutter-version: ${{ env.FLUTTER_VERSION }}
           architecture: x64
+          cache: false
 
       # 6) vcpkg（安装 libvpx/libyuv/opus/aom/ffmpeg/libsodium 等，由仓库 vcpkg.json 决定）
       - name: Setup vcpkg
@@ -79,7 +80,7 @@ jobs:
         with:
           vcpkgDirectory: C:\vcpkg
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
-          doNotCache: false
+          doNotCache: true
 
       - name: Install vcpkg dependencies
         shell: bash
