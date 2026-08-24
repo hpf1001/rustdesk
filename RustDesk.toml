@@ -1,0 +1,8 @@
+# 把这个文件放到编译好的 rustdesk.exe 同目录下，
+# 可进一步隐藏“网络/安全/账号”设置项并关闭检查更新提示（界面精简的双保险）。
+# 注：Dart 补丁已直接隐藏“网络”页签与“ID/中继服务器”输入框，本文件为补充。
+[options]
+hide-network-settings = "Y"
+hide-security-settings = "Y"
+hide-account-settings = "Y"
+enable-check-update = "N"
