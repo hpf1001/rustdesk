@@ -1,36 +1,8 @@
-# =============================================================================
-# 定制客户端配置（由 CI 自动打包进产物，放在 rustdesk.exe 同目录即生效）
-#
-# 固定（永久）密码说明：
-#   - 这里的 password 不是明文，而是 SHA256("Hpf89119811" + 下方 salt) 取前 32 字节，
-#     再做 "00" + 标准 base64 的「哈希存储」形式（与 RustDesk 官方永久密码算法一致）。
-#     这样在「无本地 salt 的全新客户端」上也能被连接验证协议正确识别。
-#   - 连接时对方只需输入明文密码：Hpf89119811
-#   - 不要手动改 password / salt，否则密码会失效。
-#
-# 行为选项（verification-method / approve-mode / access-mode / direct-server /
-#           enable-check-update）需要 apply_custom.py 对 hbb_common 的 get_or 打过
-# 补丁后才会对全新客户端生效。
-# 页签隐藏项 (hide-*-settings / disable-account) 由 HARD_SETTINGS 直读，即使补丁
-# 未命中也能隐藏。
-# =============================================================================
-
-# 固定密码（哈希存储形式） + 对应的 salt
-password = "00Y+DOnj9C9GWm1hm454KrzmjCx2bceaWSPTDDHQusdcA="
-salt = "rustdesk-custom-preset-salt"
-
+# 把这个文件放到编译好的 rustdesk.exe 同目录下，
+# 可进一步隐藏“网络/安全/账号”设置项并关闭检查更新提示（界面精简的双保险）。
+# 注：Dart 补丁已直接隐藏“网络”页签与“ID/中继服务器”输入框，本文件为补充。
 [options]
-# 允许 IP 直接访问（安全设置项，已锁进配置、UI 不再显示）
-direct-server = "Y"
-# 验证方式：仅使用固定密码（禁用一次性临时密码）
-verification-method = "use-permanent-password"
-# 审批方式：凭密码自动通过，被控端无感（不弹权限框）
-approve-mode = "password"
-# 默认访问权限：完全访问
-access-mode = "full"
-# 关闭检查更新提示
-enable-check-update = "N"
-# 双保险：即使源码补丁未命中，也隐藏这些设置页（由 HARD_SETTINGS 直读）
-hide-security-settings = "Y"
 hide-network-settings = "Y"
-disable-account = "Y"
+hide-security-settings = "Y"
+hide-account-settings = "Y"
+enable-check-update = "N"
