@@ -1,13 +1,17 @@
 # =============================================================================
-# RustDesk 自定义 Windows 客户端构建工作流  v3（2026-08-26 大修版）
+# RustDesk 自定义 Windows 客户端构建工作流  v3.1（2026-08-26 大修+编码修复版）
 # -----------------------------------------------------------------------------
 # v3 相对旧版的三处关键修复（全部对齐 rustdesk 官方 flutter-build.yml）：
 #   1) vcpkg 检出版本改为【自动读取仓库 vcpkg.json 的 baseline】。
 #      旧版硬编码的 commit 已过期，会导致 vcpkg install 一启动就失败。
 #   2) 新增官方必做的两个步骤：替换 RustDesk 定制 Flutter 引擎
 #      + 给 Flutter SDK 打 dropdown 补丁。旧版缺失这两步，构建会失败。
-#   3) 构建命令改为官方完整参数：--portable --flutter --skip-portable-pack
-#      --hwcodec --vram（旧版参数不全）。
+#   3) 构建命令改为完整官方参数：--portable --flutter --skip-portable-pack --hwcodec --vram。
+# v3.1 关键修复：
+#   - apply_custom.py 在 Windows cp1252 控制台打印中文会 UnicodeEncodeError。
+#     已加 sys.stdout.reconfigure(encoding='utf-8') 兜底。
+#   - 「Apply custom patch」步骤切到 bash 并强制 PYTHONIOENCODING=utf-8，
+#     双保险兼容任何 Windows runner 控制台编码。
 #
 # 用法：放到 fork 仓库的 .github/workflows/build-windows.yml
 #   服务器地址和 KEY 已写在 custom.json（放仓库根目录），无需配置 Secrets。
@@ -145,11 +149,24 @@ jobs:
       # 12) 应用定制补丁（内置服务器/KEY + 锁死 KEY + 精简界面）
       #     默认读取 custom.json；若配了同名 Secrets 则优先用 Secrets
       - name: Apply custom patch (server/key + UI trim)
+        shell: bash  # ★v3.1：切到 bash 以避开 Windows PowerShell 控制台编码，且强制 Python 用 UTF-8 输出
+        env:
+          PYTHONIOENCODING: utf-8
         run: |
-          $cfg = Get-Content custom.json -Raw | ConvertFrom-Json
-          $server = if ($env:RENDEZVOUS_SERVER) { $env:RENDEZVOUS_SERVER } else { $cfg.server }
-          $key    = if ($env:RS_PUB_KEY)        { $env:RS_PUB_KEY }        else { $cfg.key }
-          python apply_custom.py all --path . --server "$server" --key "$key"
+          set -e
+          if [ -z "${RENDEZVOUS_SERVER:-}" ] && [ -n "${RENDEZVOUS_SERVER:-}" ]; then :; fi  # noop
+          if [ -n "${RENDEZVOUS_SERVER:-}" ] || [ -n "${RS_PUB_KEY:-}" ]; then
+            SERVER="${RENDEZVOUS_SERVER}"
+            KEY="${RS_PUB_KEY}"
+          else
+            SERVER=$(python -c "import json; print(json.load(open('custom.json',encoding='utf-8'))['server'])")
+            KEY=$(python -c "import json; print(json.load(open('custom.json',encoding='utf-8'))['key'])")
+          fi
+          if [ -z "${SERVER:-}" ] || [ -z "${KEY:-}" ]; then
+            echo "::error::未找到服务器地址或 KEY（既未配置 Secrets，custom.json 也不完整）"
+            exit 1
+          fi
+          python apply_custom.py all --path . --server "${SERVER}" --key "${KEY}"
 
       # 13) 安装代码生成工具（版本与官方 bridge.yml 一致）
       - name: Install flutter_rust_bridge codegen

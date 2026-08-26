@@ -1,9 +1,9 @@
-# v3 修复版部署指南（这次改了什么 + 你要做什么）
+# v3.1 修复版部署指南（这次改了什么 + 你要做什么）
 
 ## 一句话总结
 
-之前失败的原因找到了 **3 个**，都已修复。你现在只需要
-**把 1 个文件（build-windows.yml）换成新版**，再重新跑一次即可。
+之前失败的原因找到了 3 个（vcpkg 版本过期 + 漏做官方必做步骤 + 编译参数不全），都已修复；v3.1 还额外修了 **1 个 Windows 控制台编码引起的 UnicodeEncodeError**。你现在只需要
+**把 1 个文件（build-windows.yml）和 1 个补丁脚本（apply_custom.py）换成新版**，再重新跑一次即可。
 
 ---
 
@@ -23,6 +23,11 @@
 ## 你要做的（只需换 1 个文件）
 
 ### 第 1 步：把新文件放进你的 rustdesk 文件夹
+
+你需要换 2 个文件：
+
+- 仓库根目录的 **`apply_custom.py`**（v3.1 新增 UTF-8 兜底）
+- `.github/workflows/` 里的 **`build-windows.yml`**（v3.1 新增 PYTHONIOENCODING 兜底）
 
 1. 下载并解压 `rustdesk-custom-win.zip`。
 2. 打开解压出的 `fork-root\.github\workflows\` 文件夹，里面有 1 个文件：`build-windows.yml`。

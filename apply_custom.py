@@ -24,9 +24,23 @@ RustDesk Windows 定制补丁脚本（跨平台，Python 3.8+）
 import os
 import re
 import sys
+import io
 import argparse
 import tempfile
 import shutil
+
+# ---- 关键：强制把 stdout/stderr 设成 UTF-8，避免 Windows cp1252 控制台打印中文崩溃 ----
+# 兼容 Python 3.7+；reconfigure 在 3.7 就有；CI / GitHub Actions 的 Windows runner 默认 cp936/cp1252。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    # 极少数环境下 reconfigure 失败，再用底层兜底
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 
 def patch_file(path, edits, dry=False, verbose=True):
