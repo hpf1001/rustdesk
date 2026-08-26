@@ -152,12 +152,11 @@ jobs:
       #     ★v3.2 修复：不再硬猜 LLVM_HOME/lib，改为自动扫描候选目录找 libclang.dll
       - name: Set LIBCLANG_PATH
         run: |
-          $candidates = @(
-            if ($env:LLVM_PATH) { "$env:LLVM_PATH\bin" } else { $null },
-            if ($env:LLVM_HOME) { "$env:LLVM_HOME\bin" } else { $null },
-            "C:\Program Files\LLVM\bin",
-            "D:\LLVM\bin"
-          ) | Where-Object { $_ -ne $null }
+          $candidates = @()
+          if ($env:LLVM_PATH) { $candidates += "$env:LLVM_PATH\bin" }
+          if ($env:LLVM_HOME) { $candidates += "$env:LLVM_HOME\bin" }
+          $candidates += "C:\Program Files\LLVM\bin"
+          $candidates += "D:\LLVM\bin"
           $found = $null
           foreach ($p in $candidates) {
             if (Test-Path "$p\libclang.dll") {
