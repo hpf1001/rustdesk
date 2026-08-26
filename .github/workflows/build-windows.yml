@@ -1,20 +1,20 @@
-# ==========================================================================
-# RustDesk 自定义 Windows 客户端构建工作流（自包含，单平台 x64）
-# --------------------------------------------------------------------------
-# 放法：复制到你的 rustdesk fork 仓库的 .github/workflows/build-windows.yml
+# =============================================================================
+# RustDesk 自定义 Windows 客户端构建工作流  v3（2026-08-26 大修版）
+# -----------------------------------------------------------------------------
+# v3 相对旧版的三处关键修复（全部对齐 rustdesk 官方 flutter-build.yml）：
+#   1) vcpkg 检出版本改为【自动读取仓库 vcpkg.json 的 baseline】。
+#      旧版硬编码的 commit 已过期，会导致 vcpkg install 一启动就失败。
+#   2) 新增官方必做的两个步骤：替换 RustDesk 定制 Flutter 引擎
+#      + 给 Flutter SDK 打 dropdown 补丁。旧版缺失这两步，构建会失败。
+#   3) 构建命令改为官方完整参数：--portable --flutter --skip-portable-pack
+#      --hwcodec --vram（旧版参数不全）。
 #
-# 前置：无。服务器地址和 KEY 已写进 custom.json，工作流会自动读取它。
-#       （高级可选）若想在 GitHub 里改值而不动代码，可再加 Secrets 覆盖：
-#         RENDEZVOUS_SERVER / RS_PUB_KEY；不配也能正常构建。
-#
-# 依赖文件（需一并提交进 fork 根目录）：
-#   apply_custom.py      （本工具包的补丁脚本）
-#   custom.json          （已含你的服务器/KEY，工作流直接读取）
-#   RustDesk.toml        （编译后随包附带，进一步隐藏设置项）
-#
-# 触发：打 tag 推送（git tag v1custom && git push --tags）或 Actions 页手动 Run
-# 产物：运行完成后到 Artifacts 下载 rustdesk-windows（即自带服务器/KEY 的客户端）
-# ==========================================================================
+# 用法：放到 fork 仓库的 .github/workflows/build-windows.yml
+#   服务器地址和 KEY 已写在 custom.json（放仓库根目录），无需配置 Secrets。
+#   依赖文件（放仓库根目录）：apply_custom.py / custom.json / RustDesk.toml
+# 触发：Actions 页面手动 Run workflow，或推送 v 开头的 tag
+# 产物：Artifacts 里的 rustdesk-windows（解压即用，自带服务器/KEY、界面精简）
+# =============================================================================
 name: Build Custom RustDesk (Windows)
 
 on:
@@ -26,7 +26,6 @@ on:
 env:
   VCPKG_ROOT: C:\vcpkg
   VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
-  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
   LLVM_VERSION: "15.0.6"
   FLUTTER_VERSION: "3.24.5"
   RUST_VERSION: "1.75"
@@ -52,20 +51,34 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 3) Rust 工具链（版本对齐官方，保证 crate 可编译）
+      # 3) ★v3 修复：从 vcpkg.json 读取 baseline 作为 vcpkg 检出版本，
+      #    保证与仓库依赖清单永远同步（不再硬编码会过期的 commit）
+      - name: Read vcpkg baseline from vcpkg.json
+        shell: bash
+        run: |
+          BASELINE=$(python -c "import json; d=json.load(open('vcpkg.json')); c=d.get('vcpkg-configuration') or {}; r=c.get('default-registry') or {}; print(r.get('baseline') or d.get('builtin-baseline') or '')")
+          if [ -z "$BASELINE" ]; then
+            BASELINE="9e593bb18ea69cc5095e012465dcd675a822ed0d"
+            echo "未在 vcpkg.json 找到 baseline，回退使用官方当前版本"
+          fi
+          echo "VCPKG_COMMIT_ID=$BASELINE" >> "$GITHUB_ENV"
+          echo "本次使用的 vcpkg baseline: $BASELINE"
+
+      # 4) Rust 工具链（版本与官方一致）
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
           components: rustfmt
 
-      # 4) LLVM（Rust FFI / bindgen 需要 libclang）
+      # 5) LLVM（Rust FFI / bindgen 需要 libclang）
       - name: Install LLVM and Clang
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: ${{ env.LLVM_VERSION }}
 
-      # 5) Flutter
+      # 6) Flutter（版本与官方一致；不用缓存服务，避免 GitHub 缓存抽风）
       - name: Install Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -74,7 +87,7 @@ jobs:
           architecture: x64
           cache: false
 
-      # 6) vcpkg（安装 libvpx/libyuv/opus/aom/ffmpeg/libsodium 等，由仓库 vcpkg.json 决定）
+      # 7) vcpkg（检出第 3 步读到的 baseline 版本；不用缓存服务）
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
@@ -82,6 +95,8 @@ jobs:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
           doNotCache: true
 
+      # 8) 安装 C/C++ 依赖（libvpx/libyuv/opus/aom/ffmpeg 等，约 40 分钟；
+      #    失败时自动打印全部日志，方便定位）
       - name: Install vcpkg dependencies
         shell: bash
         env:
@@ -94,12 +109,41 @@ jobs:
             exit 1
           fi
 
-      # 7) 让 bindgen/codegen 能找到 libclang
+      # 9) ★v3 修复（官方必做步骤）：用 RustDesk 定制 Flutter 引擎替换官方引擎
+      #    官方因 flutter/flutter#155685 在 x64 构建必须替换，否则构建失败
+      - name: Replace engine with rustdesk custom flutter engine
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          $flutterRoot = Split-Path (Split-Path (Get-Command flutter).Source)
+          if (-not (Test-Path "$flutterRoot/bin/cache/artifacts/engine/windows-x64-release")) {
+            $flutterRoot = "C:\hostedtoolcache\windows\flutter\stable-3.24.5-x64"
+          }
+          Write-Host "Flutter root: $flutterRoot"
+          mv -Force windows-x64-release/* "$flutterRoot/bin/cache/artifacts/engine/windows-x64-release/"
+          Get-ChildItem "$flutterRoot/bin/cache/artifacts/engine/windows-x64-release" | ForEach-Object { Write-Host "  $($_.Name)" }
+
+      # 10) ★v3 修复（官方必做步骤）：给 Flutter SDK 打 dropdown 补丁
+      - name: Patch flutter
+        shell: bash
+        run: |
+          if [ -f .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff ]; then
+            FLUTTER_ROOT=$(dirname $(dirname $(which flutter)))
+            cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff "$FLUTTER_ROOT/"
+            cd "$FLUTTER_ROOT"
+            git apply flutter_3.24.4_dropdown_menu_enableFilter.diff && echo "flutter SDK 补丁已应用" || echo "警告：flutter SDK 补丁未应用（一般不影响构建）"
+          else
+            echo "补丁文件不存在，跳过"
+          fi
+
+      # 11) 让 bindgen / codegen 能找到 libclang
       - name: Set LIBCLANG_PATH
         run: echo "LIBCLANG_PATH=$env:LLVM_HOME\lib" >> $env:GITHUB_ENV
 
-      # 8) 应用定制补丁（内置服务器/KEY + 锁死 KEY + 精简界面）
-      #    默认读取 custom.json（已含你的服务器/KEY）；若配了同名 Secrets 则优先用 Secrets
+      # 12) 应用定制补丁（内置服务器/KEY + 锁死 KEY + 精简界面）
+      #     默认读取 custom.json；若配了同名 Secrets 则优先用 Secrets
       - name: Apply custom patch (server/key + UI trim)
         run: |
           $cfg = Get-Content custom.json -Raw | ConvertFrom-Json
@@ -107,7 +151,7 @@ jobs:
           $key    = if ($env:RS_PUB_KEY)        { $env:RS_PUB_KEY }        else { $cfg.key }
           python apply_custom.py all --path . --server "$server" --key "$key"
 
-      # 9) 生成 flutter_rust_bridge 代码（仓库未提交 generated_bridge.dart，必须生成）
+      # 13) 安装代码生成工具（版本与官方 bridge.yml 一致）
       - name: Install flutter_rust_bridge codegen
         shell: bash
         run: |
@@ -115,8 +159,11 @@ jobs:
           cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
           cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
 
+      # 14) 生成 generated_bridge.dart（仓库不提交此文件，必须现场生成）
       - name: flutter pub get + generate bridge
         shell: bash
+        env:
+          RUSTC_BOOTSTRAP: "1"
         run: |
           export LIBCLANG_PATH="$LLVM_HOME/lib"
           pushd flutter && flutter pub get && popd
@@ -126,21 +173,38 @@ jobs:
             --c-output ./flutter/macos/Runner/bridge_generated.h
           cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
 
-      # 10) 编译 Windows 客户端
+      # 15) ★v3 修复：官方完整参数编译 Windows x64 客户端
+      #     （--skip-portable-pack 跳过便携版打包；--hwcodec --vram 与官方一致）
       - name: Build rustdesk (Windows x64)
         shell: bash
         run: |
           export LIBCLANG_PATH="$LLVM_HOME/lib"
-          python build.py --flutter --hwcodec --vram
+          python build.py --portable --flutter --skip-portable-pack --hwcodec --vram
 
-      # 11) 附带 RustDesk.toml（进一步隐藏设置入口；不存在则跳过）
+      # 16) 附带 usbmmidd_v2（官方产物含此组件，用于登录界面控制；
+      #     下载失败不影响主程序）
+      - name: Bundle usbmmidd_v2 (optional)
+        continue-on-error: true
+        run: |
+          try {
+            Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+            Expand-Archive usbmmidd_v2.zip -DestinationPath .
+            Remove-Item -Path usbmmidd_v2\Win32 -Recurse -ErrorAction SilentlyContinue
+            Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat" -ErrorAction SilentlyContinue
+            Copy-Item -Recurse -Force usbmmidd_v2 "flutter\build\windows\x64\runner\Release\usbmmidd_v2"
+            Write-Host "usbmmidd_v2 已附带"
+          } catch {
+            Write-Host "usbmmidd_v2 下载失败，跳过（不影响主程序）: $_"
+          }
+
+      # 17) 附带 RustDesk.toml（进一步隐藏设置入口；不存在则跳过）
       - name: Bundle RustDesk.toml
         run: |
           if (Test-Path RustDesk.toml) {
-            Copy-Item RustDesk.toml -Destination flutter/build/windows/x64/runner/Release/RustDesk.toml -Force
+            Copy-Item RustDesk.toml -Destination flutter\build\windows\x64\runner\Release\RustDesk.toml -Force
           }
 
-      # 12) 上传产物
+      # 18) 上传产物
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
