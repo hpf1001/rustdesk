@@ -1,5 +1,5 @@
 # =============================================================================
-# RustDesk 自定义 Windows 客户端构建工作流  v3.1（2026-08-26 大修+编码修复版）
+# RustDesk 自定义 Windows 客户端构建工作流  v3.2（2026-08-26 libclang 自动探测版）
 # -----------------------------------------------------------------------------
 # v3 相对旧版的三处关键修复（全部对齐 rustdesk 官方 flutter-build.yml）：
 #   1) vcpkg 检出版本改为【自动读取仓库 vcpkg.json 的 baseline】。
@@ -12,6 +12,12 @@
 #     已加 sys.stdout.reconfigure(encoding='utf-8') 兜底。
 #   - 「Apply custom patch」步骤切到 bash 并强制 PYTHONIOENCODING=utf-8，
 #     双保险兼容任何 Windows runner 控制台编码。
+# v3.2 关键修复：
+#   - 步骤11硬写了 `$env:LLVM_HOME\lib`，但 install-llvm-action@v2 实际输出的是
+#     `LLVM_PATH`，且 Windows 上 libclang.dll 在 `bin` 目录。结果 LIBCLANG_PATH
+#     被设成了无效路径 `\lib`，bindgen 拿到死路径后崩溃。
+#   - 改为【自动扫描候选目录找 libclang.dll】，找到才写入 GITHUB_ENV，彻底杜绝
+#     路径硬编码错误。
 #
 # 用法：放到 fork 仓库的 .github/workflows/build-windows.yml
 #   服务器地址和 KEY 已写在 custom.json（放仓库根目录），无需配置 Secrets。
@@ -143,8 +149,28 @@ jobs:
           fi
 
       # 11) 让 bindgen / codegen 能找到 libclang
+      #     ★v3.2 修复：不再硬猜 LLVM_HOME/lib，改为自动扫描候选目录找 libclang.dll
       - name: Set LIBCLANG_PATH
-        run: echo "LIBCLANG_PATH=$env:LLVM_HOME\lib" >> $env:GITHUB_ENV
+        run: |
+          $candidates = @(
+            if ($env:LLVM_PATH) { "$env:LLVM_PATH\bin" } else { $null },
+            if ($env:LLVM_HOME) { "$env:LLVM_HOME\bin" } else { $null },
+            "C:\Program Files\LLVM\bin",
+            "D:\LLVM\bin"
+          ) | Where-Object { $_ -ne $null }
+          $found = $null
+          foreach ($p in $candidates) {
+            if (Test-Path "$p\libclang.dll") {
+              $found = $p
+              break
+            }
+          }
+          if (-not $found) {
+            Write-Error "ERROR: libclang.dll not found in any candidate path!"
+            exit 1
+          }
+          echo "LIBCLANG_PATH=$found" >> $env:GITHUB_ENV
+          echo "LIBCLANG_PATH set to: $found"
 
       # 12) 应用定制补丁（内置服务器/KEY + 锁死 KEY + 精简界面）
       #     默认读取 custom.json；若配了同名 Secrets 则优先用 Secrets
@@ -172,7 +198,19 @@ jobs:
       - name: Install flutter_rust_bridge codegen
         shell: bash
         run: |
-          export LIBCLANG_PATH="$LLVM_HOME/lib"
+          _found=""
+          for _p in "$LLVM_PATH/bin" "$LLVM_HOME/bin" "/c/Program Files/LLVM/bin" "/d/LLVM/bin"; do
+            if [ -f "$_p/libclang.dll" ]; then
+              _found="$_p"
+              break
+            fi
+          done
+          if [ -z "$_found" ]; then
+            echo "::error::libclang.dll not found in any candidate path!"
+            exit 1
+          fi
+          export LIBCLANG_PATH="$_found"
+          echo "LIBCLANG_PATH=$_found"
           cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
           cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
 
@@ -182,7 +220,19 @@ jobs:
         env:
           RUSTC_BOOTSTRAP: "1"
         run: |
-          export LIBCLANG_PATH="$LLVM_HOME/lib"
+          _found=""
+          for _p in "$LLVM_PATH/bin" "$LLVM_HOME/bin" "/c/Program Files/LLVM/bin" "/d/LLVM/bin"; do
+            if [ -f "$_p/libclang.dll" ]; then
+              _found="$_p"
+              break
+            fi
+          done
+          if [ -z "$_found" ]; then
+            echo "::error::libclang.dll not found in any candidate path!"
+            exit 1
+          fi
+          export LIBCLANG_PATH="$_found"
+          echo "LIBCLANG_PATH=$_found"
           pushd flutter && flutter pub get && popd
           ~/.cargo/bin/flutter_rust_bridge_codegen \
             --rust-input ./src/flutter_ffi.rs \
@@ -195,7 +245,19 @@ jobs:
       - name: Build rustdesk (Windows x64)
         shell: bash
         run: |
-          export LIBCLANG_PATH="$LLVM_HOME/lib"
+          _found=""
+          for _p in "$LLVM_PATH/bin" "$LLVM_HOME/bin" "/c/Program Files/LLVM/bin" "/d/LLVM/bin"; do
+            if [ -f "$_p/libclang.dll" ]; then
+              _found="$_p"
+              break
+            fi
+          done
+          if [ -z "$_found" ]; then
+            echo "::error::libclang.dll not found in any candidate path!"
+            exit 1
+          fi
+          export LIBCLANG_PATH="$_found"
+          echo "LIBCLANG_PATH=$_found"
           python build.py --portable --flutter --skip-portable-pack --hwcodec --vram
 
       # 16) 附带 usbmmidd_v2（官方产物含此组件，用于登录界面控制；
