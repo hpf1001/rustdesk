@@ -13,7 +13,11 @@ RustDesk Windows 定制补丁脚本（跨平台，Python 3.8+）
   4. 精简界面：
        - 隐藏“设置”里的 网络/安全/账户/打印机 四个页签
        - 隐藏主界面上的“ID/中继服务器”输入框
-       - 主页面只保留“你的桌面”(ID+固定密码面板) 与右侧“控制远程桌面”
+       - 主页面只保留“你的桌面”(标题+简介+ID+固定密码面板) 与右侧“控制远程桌面”
+       - 隐藏“控制远程桌面”右侧 5 个浏览标签页（最近/收藏/已发现/地址簿/可访问的设备）
+  5. 体验修复：
+       - 主窗口关闭 → 最小化到系统托盘（新增 onWindowClose），服务常驻、托盘图标保留
+       - 被控端无感：强制隐藏“连接管理/连接状态”窗口（showCmWindow 改为隐藏）
 
 用法（在 rustdesk 仓库根目录运行）：
   python apply_custom.py all --path . --server "rustdesk.example.com:21116" --key "你的公钥"
@@ -157,8 +161,10 @@ def patch_rustdesk(root, dry=False):
         'offstage: true,',
     )], dry)
 
-    # 4) 主页面只保留「你的桌面」(ID + 固定密码面板) 与右侧「控制远程桌面」，
-    #    移除 Powered by / Logo / 提示 / 帮助卡片 / 插件入口等其它元素。
+    # 4) 主页面只保留「你的桌面」标题+简介(ID 面板前的“Your Desktop”提示)、
+    #    「你的桌面」ID 面板、「你的桌面」固定密码面板 与右侧「控制远程桌面」。
+    #    注意：buildTip 内含“你的桌面”四个字及其简介(desk_tip)，【必须保留】；
+    #    仅移除 Powered by / Logo / 帮助卡片 / 插件入口等其它元素。
     hp = os.path.join(root, "flutter", "lib", "desktop", "pages", "desktop_home_page.dart")
     patch_file(hp, [(
         re.compile(
@@ -166,10 +172,58 @@ def patch_rustdesk(root, dry=False):
             re.DOTALL,
         ),
         "    final children = <Widget>[\n"
+        "      buildTip(context),\n"
         "      if (!isOutgoingOnly) buildIDBoard(context),\n"
         "      if (!isOutgoingOnly) buildPasswordBoard(context),\n"
         "    ];\n",
     )], dry)
+
+    # 5) 隐藏「控制远程桌面」右侧的 5 个浏览标签页
+    #    （最近访问过 / 收藏 / 已发现 / 地址簿 / 可访问的设备）。
+    #    方式：把 PeerTabModel.isEnabled 强制全部置 false，
+    #    这样 visibleEnabledOrderedIndexs 为空，标签页栏与列表都为空，
+    #    右侧只保留顶部的“输入远程 ID 连接”输入框（控制远程桌面的核心功能）。
+    ptm = os.path.join(root, "flutter", "lib", "models", "peer_tab_model.dart")
+    patch_file(ptm, [(
+        re.compile(
+            r"  List<bool> isEnabled = List\.from\(\[\s*"
+            r"true,\s*true,\s*!isWeb,\s*"
+            r"!\(bind\.isDisableAb\(\) \|\| bind\.isDisableAccount\(\)\),\s*"
+            r"!\(bind\.isDisableGroupPanel\(\) \|\| bind\.isDisableAccount\(\)\),\s*"
+            r"\]\);",
+            re.DOTALL,
+        ),
+        "  // [custom build] 隐藏全部 5 个标签页（最近/收藏/已发现/地址簿/可访问的设备）\n"
+        "  List<bool> isEnabled = List.filled(maxTabCount, false);",
+    )], dry)
+
+    # 6) 主窗口关闭时最小化到系统托盘（而不是退出进程），
+    #    保证服务继续运行、他人仍可远程连接，右下角托盘图标保留。
+    #    原版没有 onWindowClose，导致点击关闭直接退出。
+    # 7) 被控端无感：强制隐藏“连接管理/连接状态”窗口（showCmWindow 改为隐藏）。
+    m = os.path.join(root, "flutter", "lib", "main.dart")
+    patch_file(m, [
+        (re.compile(r"class _AppState extends State<App> with WidgetsBindingObserver \{"),
+         "class _AppState extends State<App> with WidgetsBindingObserver, WindowListener {"),
+        (re.compile(r"WidgetsBinding\.instance\.addObserver\(this\);"),
+         "WidgetsBinding.instance.addObserver(this);\n    windowManager.addListener(this);"),
+        (re.compile(r"WidgetsBinding\.instance\.removeObserver\(this\);"),
+         "WidgetsBinding.instance.removeObserver(this);\n    windowManager.removeListener(this);"),
+        (re.compile(r"  @override\n  void didChangeMetrics\(\) \{"),
+         "  @override\n"
+         "  Future<void> onWindowClose() async {\n"
+         "    // [custom build] 关闭窗口 -> 最小化到系统托盘，不退出进程\n"
+         "    await windowManager.hide();\n"
+         "  }\n\n"
+         "  @override\n  void didChangeMetrics() {"),
+        (re.compile(r"\s*final hide = await bind\.cmGetConfig\(name: \"hide_cm\"\) == 'true';"),
+         "  final hide = true;  // [custom build] 强制隐藏连接管理窗口（被控端无感）"),
+        (re.compile(r"showCmWindow\(\{bool isStartup = false\}\) async \{.*?\n\}\n", re.DOTALL),
+         "// [custom build] 被控端无感：任何“显示连接管理窗口”的请求都改为隐藏\n"
+         "showCmWindow({bool isStartup = false}) async {\n"
+         "  await hideCmWindow(isStartup: isStartup);\n"
+         "}\n"),
+    ], dry)
 
 
 def cmd_all(root, server, key, dry):
@@ -269,6 +323,48 @@ def selftest():
                 '  }\n'
             )
 
+        # peer_tab_model.dart
+        models = os.path.join(tmp, "rs", "flutter", "lib", "models")
+        os.makedirs(models)
+        with open(os.path.join(models, "peer_tab_model.dart"), "w", encoding="utf-8") as f:
+            f.write(
+                "  List<bool> isEnabled = List.from([\n"
+                "    true,\n"
+                "    true,\n"
+                "    !isWeb,\n"
+                "    !(bind.isDisableAb() || bind.isDisableAccount()),\n"
+                "    !(bind.isDisableGroupPanel() || bind.isDisableAccount()),\n"
+                "  ]);\n"
+            )
+        # main.dart
+        libdir = os.path.join(tmp, "rs", "flutter", "lib")
+        os.makedirs(libdir, exist_ok=True)
+        with open(os.path.join(libdir, "main.dart"), "w", encoding="utf-8") as f:
+            f.write(
+                "class _AppState extends State<App> with WidgetsBindingObserver {\n"
+                "  @override\n  void initState() {\n"
+                "    super.initState();\n"
+                "    WidgetsBinding.instance.addObserver(this);\n"
+                "  }\n\n"
+                "  @override\n  void dispose() {\n"
+                "    WidgetsBinding.instance.removeObserver(this);\n"
+                "    super.dispose();\n"
+                "  }\n\n"
+                "  @override\n  void didChangeMetrics() {\n"
+                "    _updateOrientation();\n"
+                "  }\n\n"
+                "void runConnectionManagerScreen() async {\n"
+                "  final hide = await bind.cmGetConfig(name: \"hide_cm\") == 'true';\n"
+                "}\n\n"
+                "showCmWindow({bool isStartup = false}) async {\n"
+                "  if (isStartup) {\n"
+                "    await windowManager.show();\n"
+                "  } else if (_isCmReadyToShow) {\n"
+                "    await windowManager.show();\n"
+                "  }\n"
+                "}\n"
+            )
+
         patch_hbb(os.path.join(tmp, "hbb"), "my.rustdesk.com:21116", "MYKEY123", dry=False)
         patch_rustdesk(os.path.join(tmp, "rs"), dry=False)
 
@@ -292,11 +388,24 @@ def selftest():
 
         hp = open(os.path.join(pages, "desktop_home_page.dart"), encoding="utf-8").read()
         assert 'buildIDBoard(context)' in hp, "主页面 ID 面板缺失"
+        assert 'buildTip(context)' in hp, "主页面“你的桌面”标题/简介未保留"
         assert 'loadPowered' not in hp, "主页面 Powered by 未移除"
         assert 'loadLogo' not in hp, "主页面 Logo 未移除"
-        assert 'buildTip' not in hp, "主页面提示未移除"
         assert 'buildHelpCards' not in hp, "主页面帮助卡片未移除"
         assert 'buildPluginEntry' not in hp, "主页面插件入口未移除"
+
+        ptm = open(os.path.join(models, "peer_tab_model.dart"), encoding="utf-8").read()
+        assert 'List.filled(maxTabCount, false)' in ptm, "5 个标签页未隐藏"
+        assert 'List.from([' not in ptm, "isEnabled 未被替换"
+
+        m = open(os.path.join(libdir, "main.dart"), encoding="utf-8").read()
+        assert 'with WidgetsBindingObserver, WindowListener {' in m, "WindowListener 未添加"
+        assert 'windowManager.addListener(this);' in m, "addListener 未添加"
+        assert 'windowManager.removeListener(this);' in m, "removeListener 未添加"
+        assert 'Future<void> onWindowClose() async' in m, "onWindowClose 未添加"
+        assert 'final hide = true;' in m, "连接管理窗口未强制隐藏"
+        assert 'await hideCmWindow(isStartup: isStartup);' in m, "showCmWindow 未重定向为隐藏"
+        assert 'bind.cmGetConfig(name: "hide_cm")' not in m, "cm 配置判断残留"
 
         print("SELFTEST PASSED ✓  所有正则均命中当前源码结构，替换结果正确。")
         return True
