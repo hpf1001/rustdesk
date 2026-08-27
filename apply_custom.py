@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RustDesk Windows 定制补丁脚本 v3.5（跨平台，Python 3.8+）
+RustDesk Windows 定制补丁脚本 v3.6（跨平台，Python 3.8+）
 =====================================================
 作用：
   1. 把自建 ID/中继服务器地址和公钥 KEY 烧进源码（hbb_common/src/config.rs）
@@ -13,15 +13,19 @@ RustDesk Windows 定制补丁脚本 v3.5（跨平台，Python 3.8+）
        - 隐藏主界面上的“ID/中继服务器”输入框
        - 主页面只保留“你的桌面”(标题+简介+ID+固定密码面板) 与右侧“控制远程桌面”
        - 隐藏“控制远程桌面”下方 5 个浏览标签页（最近/收藏/已发现/地址簿/可访问的设备）
-  5. v3.5 两项修复（对应上一版构建后的两个遗留问题）：
-       - 【问题2·托盘图标】Windows 上托盘是独立进程(rustdesk.exe --tray)，原版只在
-         「服务进程已运行」时才拉起它——便携版直接双击运行时永远不会启动，所以右下角
-         没有图标。本补丁改为：无参数启动主程序时【无条件】确保托盘进程在运行。
-         （主窗口点 X 只是隐藏，点托盘图标即可重新打开；他人始终可以远程连接）
-       - 【问题3·标签页】旧补丁按内容精确匹配 isEnabled 初始化，而你 fork 的仓库
-         （新版源码）第三项多了 disable-discovery-panel 条件导致正则失配、静默跳过。
-         现改为「结构匹配」并把 PeerTabPage 从布局中直接移除，双保险。
-  6. v3.5 新增【补丁后强制校验】：任何一个关键补丁没打上，脚本立刻报错退出，
+  5. v3.6 修复【关闭窗口后被控断联】+【开机自启常驻待机】：
+       - 根源：便携版的被控服务(server)原本跑在【主界面进程内的一个线程】里，
+         主界面一退出它就跟着死；而托盘是独立进程、图标还挂着——于是出现
+         “图标在、看着服务已启动、实际早已断联”的假象。
+       - 修复：被控服务改由【托盘进程】承载（托盘进程永不退出）：
+         · 主界面随便关、甚至进程结束，被控在线不受影响；
+         · 托盘进程启动时自动把自己注册进“开机自启”（注册表 Run 键，
+           参数 --tray：开机静默进入右下角待机，不弹主窗口）；
+         · 点托盘图标即可重新打开主界面。
+  6. v3.5 两项修复保留：
+       - 【托盘图标】无参数启动主程序时无条件确保托盘进程在运行（独立 --tray 进程）。
+       - 【标签页】结构匹配 + 从布局中直接移除，双保险。
+  7. v3.5 起的【补丁后强制校验】：任何一个关键补丁没打上，脚本立刻报错退出，
      让 GitHub Actions 构建当场失败并显示原因——绝不再出现
      「正则静默失配 → 白等 2 小时构建出未修复版本」的情况。
   7. v3.4 已验证有效的修复全部保留：
@@ -198,14 +202,78 @@ def patch_rustdesk(root, dry=False):
     #      1.3.9:      check_process("--server", false) && !check_process("--tray", true)
     #      1.4.x:      is_server_running && !check_process("--tray", true)
     #      更新 master: should_check_start_tray && !check_process("--tray", true)
+    #
+    # 6a) 【v3.6·问题5 主修复一】被控服务改由托盘进程承载。
+    #     便携版原逻辑：无参数启动时 std::thread::spawn(start_server) —— 被控服务
+    #     是主界面进程内的一个线程，主界面退出它就死（这正是“关闭窗口后无法远程、
+    #     已连接断开”的根源；而托盘图标是独立进程还挂着，造成“服务在跑”的假象）。
+    #     修复：主界面进程不再自己跑 server 线程，改为确保托盘进程在跑（托盘进程
+    #     承载 server，见 6b）。run_me 失败时保留线程版兜底。
+    #
+    # 6b) 【v3.6·问题5 主修复二】托盘进程承载被控服务 + 注册开机自启。
+    #     --tray 分支：在启动托盘图标前 spawn server 线程（托盘进程永不退出，
+    #     被控因此常驻），并把自己写入注册表 Run 键（幂等：路径变化时刷新），
+    #     开机登录后以 --tray 静默待机（右下角图标 + 被控在线，不弹主窗口）。
     cm = os.path.join(root, "src", "core_main.rs")
+    p2_re = re.compile(
+        r'else if args\[0\] == "--tray" \{\s*\n\s*'
+        r'if !crate::check_process\("--tray", true\) \{\s*\n\s*'
+        r'crate::tray::start_tray\(\);\s*\n\s*\}\s*\n\s*'
+        r'return None;\s*\n\s*\}'
+    )
+    p2_repl = (
+        'else if args[0] == "--tray" {\n'
+        '    // [custom build] v3.6: 托盘进程承载被控服务 + 注册开机自启\n'
+        '    if !crate::check_process("--tray", true) {\n'
+        '        std::thread::spawn(move || crate::start_server(false, false));\n'
+        '        #[cfg(windows)]\n'
+        '        {\n'
+        '            use winreg::{enums::*, RegKey};\n'
+        '            let hkcu = RegKey::predef(HKEY_CURRENT_USER);\n'
+        '            if let (Ok(cur_exe), Ok((key, _))) = (\n'
+        '                std::env::current_exe(),\n'
+        '                hkcu.create_subkey("Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run"),\n'
+        '            ) {\n'
+        '                let want: String = format!("\\"{}\\" --tray", cur_exe.to_string_lossy());\n'
+        '                let cur: String = key\n'
+        '                    .get_value(crate::get_app_name())\n'
+        '                    .unwrap_or_default();\n'
+        '                if cur != want {\n'
+        '                    let _ = key.set_value(crate::get_app_name(), &want);\n'
+        '                }\n'
+        '            }\n'
+        '        }\n'
+        '        crate::tray::start_tray();\n'
+        '    }\n'
+        '    return None;\n'
+        '}'
+    )
     patch_file(cm, [
+        # v3.5：三种源码形态的托盘拉起条件 → 无条件
         (re.compile(
             r'crate::check_process\("--server", false\) && !crate::check_process\("--tray", true\)'
         ), '!crate::check_process("--tray", true)'),
         (re.compile(
             r'(?:is_server_running|should_check_start_tray) && !crate::check_process\("--tray", true\)'
         ), '!crate::check_process("--tray", true)'),
+        # v3.6 P1：主界面进程不再跑 server 线程（1.3.9 与 master 此行文本一致、全文件唯一；
+        #          macos 分支的同名调用参数不同 (true, false)，不会误匹配）
+        (re.compile(
+            r'std::thread::spawn\(move \|\| crate::start_server\(false, no_server\)\);'
+        ),
+         '// [custom build] v3.6: 便携版被控服务由 --tray 进程承载，主界面退出不影响被控\n'
+         '        if !crate::check_process("--tray", true) {\n'
+         '            if crate::run_me(vec!["--tray"]).is_err() {\n'
+         '                std::thread::spawn(move || crate::start_server(false, no_server));\n'
+         '            }\n'
+         '        }'),
+        # v3.6 P2：--tray 分支承载 server + 注册开机自启（锚定 else if args[0] == "--tray"，
+        #          不会碰到启动分支里 v3.5 改出来的同名 if）。
+        #          注意：用 lambda 函数替换而非模板字符串——re.subn 的模板会把 "\\"
+        #          再解释一次导致写入 Rust 源码的反斜杠数减半（变成非法转义），
+        #          函数返回值则按字面写入，p2_repl 里写的就是最终文件内容。
+        (p2_re,
+         lambda m: p2_repl),
     ], dry)
 
     # 7) 主窗口关闭时最小化到系统托盘（v3.4 已生效，保留）：
@@ -242,7 +310,7 @@ def verify_patches(rs_root, hbb_root=None, server="", key=""):
     """补丁全部打完后立刻校验关键特征。
     CRITICAL 项失配 -> 打印原因并返回 False（调用方 exit 1，构建当场失败）；
     WARNING  项失配 -> 只打印警告（不影响构建，但提示哪些定制可能没生效）。"""
-    print("==> 校验补丁结果（v3.5 防静默失配检查）")
+    print("==> 校验补丁结果（v3.6 防静默失配检查，含常驻被控/开机自启六项）")
 
     critical_errors = []
     warn_errors = []
@@ -271,6 +339,17 @@ def verify_patches(rs_root, hbb_root=None, server="", key=""):
               # 替换成功的标志：启动分支的 if 后紧跟 linux cfg（--tray 分支的 if 后是 start_tray）
               (r'if !crate::check_process\("--tray", true\) \{\s*\n\s*#\[cfg\(target_os = "linux"\)\]',
                True),
+          ])
+    check("CRIT-问题5 被控常驻托盘进程+开机自启 (src/core_main.rs)",
+          os.path.join(rs_root, "src", "core_main.rs"), [
+              # P1 生效标志：主界面不再无条件跑 server 线程（兜底分支仍在，但带注释前缀）
+              (r'// \[custom build\] v3\.6: 便携版被控服务由 --tray 进程承载，主界面退出不影响被控', True),
+              # P2 生效标志：--tray 分支的 server 线程、自启注册
+              (r'// \[custom build\] v3\.6: 托盘进程承载被控服务 \+ 注册开机自启', True),
+              (r'std::thread::spawn\(move \|\| crate::start_server\(false, false\)\);', True),
+              (r'use winreg::\{enums::\*, RegKey\};', True),
+              (r'create_subkey\("Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run"\)', True),
+              (r'if crate::run_me\(vec!\["--tray"\]\)\.is_err\(\)', True),
           ])
     check("CRIT-问题3 标签页布局移除 (connection_page.dart)",
           os.path.join(rs_root, "flutter", "lib", "desktop", "pages", "connection_page.dart"), [
@@ -388,7 +467,7 @@ def selftest():
                 '        });\n'
                 '    }\n'
             )
-        # src/core_main.rs —— 覆盖三种已知源码形态 + --tray 分支干扰项
+        # src/core_main.rs —— 覆盖三种已知源码形态 + --tray 分支 + 便携版 server 线程行
         with open(os.path.join(rs_src, "core_main.rs"), "w", encoding="utf-8") as f:
             f.write(
                 '#[cfg(any(target_os = "linux", target_os = "windows"))]\n'
@@ -413,8 +492,17 @@ def selftest():
                 '        hbb_common::allow_err!(crate::run_me(vec!["--tray"]));\n'
                 '    }\n'
                 '}\n'
+                # v3.6 P1 目标行：便携版无参数启动时的 server 线程（1.3.9 与 master 文本一致）
+                'fn main_ui_startup() {\n'
+                '    if args.is_empty() {\n'
+                '        std::thread::spawn(move || crate::start_server(false, no_server));\n'
+                '    }\n'
+                '}\n'
+                # --tray 分支（真实源码为 else if 形态）
                 'fn tray_branch() {\n'
-                '    if args[0] == "--tray" {\n'
+                '    if args[0] == "--remove" {\n'
+                '        return None;\n'
+                '    } else if args[0] == "--tray" {\n'
                 '        if !crate::check_process("--tray", true) {\n'
                 '            crate::tray::start_tray();\n'
                 '        }\n'
@@ -557,13 +645,22 @@ def selftest():
         cl = open(os.path.join(rs_src, "client.rs"), encoding="utf-8").read()
         assert 'get_rs_pk(config::RS_PUB_KEY);' in cl, "key 锁死失败"
 
-        # core_main.rs：三种形态的条件全部被剥离，--tray 分支保持原样
+        # core_main.rs：三种形态的条件全部被剥离，--tray 分支被 v3.6 增强但 start_tray 保留
         cm = open(os.path.join(rs_src, "core_main.rs"), encoding="utf-8").read()
         assert 'check_process("--server", false) &&' not in cm, "1.3.9 形态托盘条件未剥离"
         assert 'is_server_running && !crate::check_process' not in cm, "1.4.0 形态托盘条件未剥离"
         assert 'should_check_start_tray && !crate::check_process' not in cm, "master 形态托盘条件未剥离"
-        assert cm.count('if !crate::check_process("--tray", true) {') == 4, "托盘条件替换计数不符"
+        assert cm.count('if !crate::check_process("--tray", true) {') == 5, "托盘条件替换计数不符"
         assert 'crate::tray::start_tray();' in cm, "--tray 分支被误改"
+        # v3.6 P1：主界面不再直接跑 server 线程（仅留 run_me 失败兜底）
+        assert '主界面退出不影响被控' in cm, "P1 注释缺失（便携版 server 线程替换失败）"
+        assert 'if crate::run_me(vec!["--tray"]).is_err()' in cm, "P1 兜底分支缺失"
+        # v3.6 P2：托盘进程承载 server + 注册开机自启
+        assert '托盘进程承载被控服务 + 注册开机自启' in cm, "P2 注释缺失（--tray 分支替换失败）"
+        assert 'std::thread::spawn(move || crate::start_server(false, false));' in cm, "P2 server 线程缺失"
+        assert 'use winreg::{enums::*, RegKey};' in cm, "P2 winreg 导入缺失"
+        assert 'CurrentVersion\\\\Run' in cm, "P2 注册表 Run 路径缺失"
+        assert 'hkcu.create_subkey' in cm, "P2 create_subkey 缺失"
 
         dsp = open(os.path.join(pages, "desktop_setting_page.dart"), encoding="utf-8").read()
         assert '// SettingsTabKey.network,  (hidden by custom build)' in dsp, "网络页签隐藏失败"
