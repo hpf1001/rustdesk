@@ -1,26 +1,37 @@
 # =============================================================================
-# RustDesk 自定义 Windows 客户端构建工作流  v3.5（2026-08-26 托盘+标签页修复版）
+# RustDesk 自定义 Windows 客户端构建工作流  v3.7（2026-08-26 固定密码+退出不锁屏版）
 # -----------------------------------------------------------------------------
-# v3.5 新增能力（全部在 apply_custom.py 中实现，本工作流步骤不变）：
-#   - 修复②：托盘图标常驻。Windows 托盘是独立进程(rustdesk.exe --tray)，原版只在
-#            服务已安装运行时才拉起它，便携版直接双击运行永远没有图标。现改为
-#            启动主程序时无条件拉起托盘进程：点关闭窗口只隐藏到后台，右下角图标
-#            保留，点托盘图标可重新打开主窗口，他人始终可远程连接。
-#   - 修复③：隐藏“控制远程桌面”下方 5 个浏览标签页（最近访问过/收藏/已发现/
-#            地址簿/可访问的设备）。旧补丁按内容精确匹配 isEnabled 初始化，新版
-#            源码该项多了 disable-discovery-panel 条件导致静默失配。现改为结构
-#            匹配 + 从布局直接移除 PeerTabPage，双保险。
-#   - 新增：补丁后强制自检。任何关键补丁未生效，构建当场失败并显示原因，
-#            不再出现“白等 2 小时构建出未修复版本”。
+# v3.7 新增能力（apply_custom.py + custom.txt 实现）：
+#   - 修复⑤：新电脑上固定密码(Hpf89119811)连不上、只能用一次性密码。
+#     根源：官方自定义客户端配置只有 exe 同目录的 custom.txt 一条路，且必须
+#     有 RustDesk 官方私钥的签名（自建拿不到）；此前附带的 RustDesk.toml
+#     客户端【从来不读】——固定密码预设从未生效。新电脑没有本地永久密码，
+#     就只剩一次性密码。
+#     修法：补丁让 read_custom_client 验签失败时按无签名纯 JSON 解析，
+#     并随产物附带 custom.txt（password/salt 预设 + override-settings）。
+#     固定密码在「本地未另设永久密码」的机器上始终有效。
+#   - 修复⑥：退出远程后被控电脑自动锁屏。
+#     根源：“会话结束后锁定”由【控制端】勾选后通过连接选项下发给每台被控机。
+#     修法：被控端补丁忽略该指令——无论控制端勾什么，退出一律不锁屏。
+# v3.6 已验证有效的修复全部保留（被控常驻托盘进程、开机自启、假在线修复）：
+#   - 修复④（本次核心）：便携版点右上角 × 后“假在线”——图标还在、界面显示
+#     服务已启动，实际被控已断（远程连不上、已连接的也会被踢下线）。
+#     根源：便携版的被控服务是跑在主界面进程里的一个线程，界面一关服务就死；
+#     而托盘图标是独立进程，还活着，造成“看似在线实际断联”的假象。
+#     修法：把被控服务搬进托盘进程（--tray，永不退出），主界面随便关、随便死，
+#     被控都不断；点托盘图标随时重开主窗口。
+#   - 新增：开机自启。托盘进程启动时会自动在注册表
+#     HKCU\Software\Microsoft\Windows\CurrentVersion\Run 写入自启项
+#     （"程序路径" --tray），开机登录后静默驻留托盘待机（不弹任何窗口），
+#     随时可被远程。即：不用安装服务，达到安装版的常驻被控效果。
+# v3.5 已验证有效的修复全部保留（托盘图标常驻、5 个标签页隐藏、补丁自检）：
+#   - 修复②：托盘图标常驻（双击运行主程序即拉起托盘进程）。
+#   - 修复③：隐藏“控制远程桌面”下方 5 个浏览标签页（结构匹配+布局移除双保险）。
+#   - 补丁后强制自检，关键补丁未生效当场构建失败并写明原因。
 # v3.4 已验证有效的修复全部保留（主页面标题显示、关闭最小化到托盘、无感连接）。
-# v3.3 新增能力（全部在 apply_custom.py / RustDesk.toml 中实现，本工作流步骤不变）：
-#   - 主页面只保留「你的桌面」(ID+固定密码面板) 与右侧「控制远程桌面」，
-#     移除 Powered by / Logo / 提示 / 帮助卡片 / 插件入口。
-#   - 隐藏「设置」里的 网络 / 安全 / 账户 / 打印机 四个页签。
-#   - RustDesk.toml 预设：固定密码(哈希形式)、IP 直接访问、仅固定密码验证、
-#     凭密码自动通过(被控端无感)、默认完全访问、关闭检查更新。
-#   - 修补 hbb_common 的 get_or，让 RustDesk.toml [options] 行为选项对全新客户端
-#     真正生效（原解析链不含 HARD_SETTINGS，toml 行为选项原本无效）。
+# v3.3 主页面/设置页精简保留。注意：v3.3 时代用 RustDesk.toml 预设固定密码的
+#     做法从未生效（客户端不读 toml），v3.7 起改用 custom.txt（password/salt +
+#     override-settings，验证方式/直接访问/自动通过等行为选项全部在其中）。
 #
 # v3 相对旧版的三处关键修复（全部对齐 rustdesk 官方 flutter-build.yml）：
 #   1) vcpkg 检出版本改为【自动读取仓库 vcpkg.json 的 baseline】。
@@ -42,9 +53,10 @@
 #
 # 用法：放到 fork 仓库的 .github/workflows/build-windows.yml
 #   服务器地址和 KEY 已写在 custom.json（放仓库根目录），无需配置 Secrets。
-#   依赖文件（放仓库根目录）：apply_custom.py / custom.json / RustDesk.toml
+#   依赖文件（放仓库根目录）：apply_custom.py / custom.json / custom.txt
 # 触发：Actions 页面手动 Run workflow，或推送 v 开头的 tag
-# 产物：Artifacts 里的 rustdesk-windows（解压即用，自带服务器/KEY、界面精简）
+# 产物：Artifacts 里的 rustdesk-windows（解压即用，自带服务器/KEY、界面精简、
+#       固定密码预设、退出远程不锁屏）
 # =============================================================================
 name: Build Custom RustDesk (Windows)
 
@@ -296,11 +308,16 @@ jobs:
             Write-Host "usbmmidd_v2 下载失败，跳过（不影响主程序）: $_"
           }
 
-      # 17) 附带 RustDesk.toml（进一步隐藏设置入口；不存在则跳过）
-      - name: Bundle RustDesk.toml
+      # 17) 附带 custom.txt（v3.7：固定密码/行为选项预设，exe 启动时读取；
+      #     签名验证已由 apply_custom.py 补丁改为失败时按纯 JSON 回退解析）
+      - name: Bundle custom.txt (v3.7 preset)
         run: |
-          if (Test-Path RustDesk.toml) {
-            Copy-Item RustDesk.toml -Destination flutter\build\windows\x64\runner\Release\RustDesk.toml -Force
+          if (Test-Path custom.txt) {
+            Copy-Item custom.txt -Destination flutter\build\windows\x64\runner\Release\custom.txt -Force
+            Get-Content custom.txt
+          } else {
+            echo "::error::custom.txt 不在仓库根目录！固定密码预设将无法生效。"
+            exit 1
           }
 
       # 18) 上传产物

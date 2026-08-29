@@ -1,19 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RustDesk Windows 定制补丁脚本 v3.6（跨平台，Python 3.8+）
+RustDesk Windows 定制补丁脚本 v3.7（跨平台，Python 3.8+）
 =====================================================
 作用：
   1. 把自建 ID/中继服务器地址和公钥 KEY 烧进源码（hbb_common/src/config.rs）
   2. 锁死 KEY，使客户端不使用用户在“设置-网络”里填写的 key（始终用内置 RS_PUB_KEY）
-  3. 让 RustDesk.toml 的 [options] 预设真正生效（修补 hbb_common 的 get_or，
-     把 HARD_SETTINGS 作为「预设」插在 LOCAL 与 DEFAULT 之间）
+  3. 让 custom.txt 的预设真正生效（修补 hbb_common 的 get_or，把 HARD_SETTINGS
+     作为「预设」插在 LOCAL 与 DEFAULT 之间；v3.7 起 custom.txt 无签名纯 JSON
+     可被解析，取代从未被读取的 RustDesk.toml）
   4. 精简界面：
        - 隐藏“设置”里的 网络/安全/账户/打印机 四个页签
        - 隐藏主界面上的“ID/中继服务器”输入框
        - 主页面只保留“你的桌面”(标题+简介+ID+固定密码面板) 与右侧“控制远程桌面”
        - 隐藏“控制远程桌面”下方 5 个浏览标签页（最近/收藏/已发现/地址簿/可访问的设备）
-  5. v3.6 修复【关闭窗口后被控断联】+【开机自启常驻待机】：
+  5. v3.7 修复【固定密码失效 + 退出远程后自动锁屏】：
+       - 根源一（固定密码）：RustDesk 自定义客户端配置只有一条官方加载路径——
+         exe 同目录的 custom.txt（base64 + RustDesk 官方私钥签名，我们无法伪造）。
+         之前各版本附带的 RustDesk.toml 客户端【从来不读】（全源码无读取代码），
+         所以 v3.3 起预设的固定密码/行为选项从未生效——新电脑上没有本地永久
+         密码，就只剩一次性密码可连。
+       - 修复一：给 src/common.rs 的 read_custom_client() 打补丁——签名校验
+         失败时回退按「无签名纯 JSON」解析。再随产物附带一份纯 JSON 的
+         custom.txt（含 password/salt 预设密码与 override-settings 行为选项，
+         放在 exe 同目录），固定密码即可生效（1.3.9 与 master 该函数逐字一致，
+         一个正则通吃）。
+       - 根源二（自动锁屏）：“会话结束后锁定”是【控制端】通过 OptionMessage
+         下发给被控端的（被控端 src/server/connection.rs 默认 false、收到
+         Yes 才锁）。控制端勾选/默认值置 Y 后，每台被控机退出即锁屏。
+       - 修复二：被控端补丁——忽略控制端下发的 lock_after_session_end，
+         任何情况下退出远程都不锁屏（1.3.9 路径 src/connection.rs 与
+         master 路径 src/server/connection.rs 均覆盖，存在哪个打哪个）。
+  6. v3.6 修复【关闭窗口后被控断联】+【开机自启常驻待机】（保留）：
        - 根源：便携版的被控服务(server)原本跑在【主界面进程内的一个线程】里，
          主界面一退出它就跟着死；而托盘是独立进程、图标还挂着——于是出现
          “图标在、看着服务已启动、实际早已断联”的假象。
@@ -22,13 +40,13 @@ RustDesk Windows 定制补丁脚本 v3.6（跨平台，Python 3.8+）
          · 托盘进程启动时自动把自己注册进“开机自启”（注册表 Run 键，
            参数 --tray：开机静默进入右下角待机，不弹主窗口）；
          · 点托盘图标即可重新打开主界面。
-  6. v3.5 两项修复保留：
+  7. v3.5 两项修复保留：
        - 【托盘图标】无参数启动主程序时无条件确保托盘进程在运行（独立 --tray 进程）。
        - 【标签页】结构匹配 + 从布局中直接移除，双保险。
-  7. v3.5 起的【补丁后强制校验】：任何一个关键补丁没打上，脚本立刻报错退出，
+  8. v3.5 起的【补丁后强制校验】：任何一个关键补丁没打上，脚本立刻报错退出，
      让 GitHub Actions 构建当场失败并显示原因——绝不再出现
      「正则静默失配 → 白等 2 小时构建出未修复版本」的情况。
-  7. v3.4 已验证有效的修复全部保留：
+  9. v3.4 已验证有效的修复全部保留：
        - 主窗口关闭 → 隐藏到托盘（onWindowClose），服务常驻
        - 被控端无感：强制隐藏“连接管理/连接状态”窗口
 
@@ -117,9 +135,100 @@ def patch_hbb(root, server, key, dry=False):
     patch_file(p, edits, dry)
 
 
-# ---------- rustdesk 本体（KEY 锁死 + 界面精简 + 托盘修复） ----------
+# ---------- v3.7 P1：custom.txt 无签名纯 JSON 回退（src/common.rs） ----------
+# read_custom_client 原逻辑：decode64 -> 官方公钥验签 -> JSON 解析。
+# 签名私钥在 RustDesk 官方手里，自建客户端永远过不了验签 -> custom.txt 形同虚设。
+# 补丁：验签失败时回退把输入当纯 JSON 解析（1.3.9 与 master 此段逐字一致）。
+# 配套：仓库根放一份纯 JSON custom.txt，工作流把它复制到 exe 同目录。
+READ_CUSTOM_RE = re.compile(
+    r'pub fn read_custom_client\(config: &str\) \{\s*\n'
+    r'\s*let Ok\(data\) = decode64\(config\) else \{\s*\n'
+    r'\s*log::error!\("Failed to decode custom client config"\);\s*\n'
+    r'\s*return;\s*\n\s*\};\s*\n'
+    r'\s*const KEY: &str = "5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM=";\s*\n'
+    r'\s*let Some\(pk\) = get_rs_pk\(KEY\) else \{\s*\n'
+    r'\s*log::error!\("Failed to parse public key of custom client"\);\s*\n'
+    r'\s*return;\s*\n\s*\};\s*\n'
+    r'\s*let Ok\(data\) = sign::verify\(&data, &pk\) else \{\s*\n'
+    r'\s*log::error!\("Failed to dec custom client config"\);\s*\n'
+    r'\s*return;\s*\n\s*\};\s*\n'
+    r'\s*let Ok\(mut data\) =\s*\n'
+    r'\s*serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>\(&data\)\s*\n'
+    r'\s*else \{\s*\n'
+    r'\s*log::error!\("Failed to parse custom client config"\);\s*\n'
+    r'\s*return;\s*\n\s*\};'
+)
+READ_CUSTOM_REPL = (
+    'pub fn read_custom_client(config: &str) {\n'
+    '    // [custom build] v3.7: official custom.txt must be signed with\n'
+    '    // RustDesk\'s private key, which self-hosted builds cannot produce.\n'
+    '    // Try the signed path first; if it fails, fall back to parsing the\n'
+    '    // input as plain JSON so unsigned custom.txt presets (password/salt,\n'
+    '    // override-settings) take effect.\n'
+    '    let mut parsed: Option<std::collections::HashMap<String, serde_json::Value>> = None;\n'
+    '    if let Ok(encoded) = decode64(config) {\n'
+    '        const KEY: &str = "5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM=";\n'
+    '        if let Some(pk) = get_rs_pk(KEY) {\n'
+    '            if let Ok(verified) = sign::verify(&encoded, &pk) {\n'
+    '                parsed = serde_json::from_slice(&verified).ok();\n'
+    '            }\n'
+    '        }\n'
+    '    }\n'
+    '    if parsed.is_none() {\n'
+    '        parsed = serde_json::from_str(config).ok();\n'
+    '    }\n'
+    '    let Some(mut data) = parsed else {\n'
+    '        log::error!("Failed to parse custom client config");\n'
+    '        return;\n'
+    '    };'
+)
+
+
+def patch_common(root, dry=False):
+    print("==> v3.7 P1: custom.txt 无签名纯 JSON 回退 (src/common.rs)")
+    p = os.path.join(root, "src", "common.rs")
+    patch_file(p, [(READ_CUSTOM_RE, lambda m: READ_CUSTOM_REPL)], dry)
+
+
+# ---------- v3.7 P2：被控端忽略“退出后锁屏”（connection.rs） ----------
+# lock_after_session_end 由控制端通过 OptionMessage 下发（被控端默认 false）。
+# 补丁后无论控制端勾什么，被控机退出远程一律不锁屏。
+# master 路径 src/server/connection.rs；1.3.9 路径 src/connection.rs（两版文本一致）。
+LOCK_RE = re.compile(
+    r'if let Ok\(q\) = o\.lock_after_session_end\.enum_value\(\) \{\s*\n'
+    r'\s*if q != BoolOption::NotSet \{\s*\n'
+    r'\s*self\.lock_after_session_end = q == BoolOption::Yes;\s*\n'
+    r'\s*\}\s*\n\s*\}'
+)
+LOCK_REPL = (
+    'if let Ok(q) = o.lock_after_session_end.enum_value() {\n'
+    '            if q != BoolOption::NotSet {\n'
+    '                // [custom build] v3.7: ignore the controller\'s\n'
+    '                // lock-after-session-end request; the controlled PC\n'
+    '                // must never auto-lock when the session ends.\n'
+    '                self.lock_after_session_end = false;\n'
+    '            }\n'
+    '        }'
+)
+
+
+def patch_server_conn(root, dry=False):
+    print("==> v3.7 P2: 被控端忽略退出锁屏指令 (src/server/connection.rs 或 src/connection.rs)")
+    for p in (
+        os.path.join(root, "src", "server", "connection.rs"),
+        os.path.join(root, "src", "connection.rs"),
+    ):
+        if patch_file(p, [(LOCK_RE, lambda m: LOCK_REPL)], dry):
+            return
+    if not dry:
+        print("  [WARN] 两个候选路径都不存在，跳过（正常不应发生）")
+
+
+
 def patch_rustdesk(root, dry=False):
     print("==> 处理 rustdesk 本体 (KEY 锁死 + 界面精简 + 托盘修复)")
+    patch_common(root, dry)
+    patch_server_conn(root, dry)
 
     # 1) KEY 锁死：secure_connection 里始终使用内置 RS_PUB_KEY，忽略用户在设置里填的 key
     client = os.path.join(root, "src", "client.rs")
@@ -310,7 +419,7 @@ def verify_patches(rs_root, hbb_root=None, server="", key=""):
     """补丁全部打完后立刻校验关键特征。
     CRITICAL 项失配 -> 打印原因并返回 False（调用方 exit 1，构建当场失败）；
     WARNING  项失配 -> 只打印警告（不影响构建，但提示哪些定制可能没生效）。"""
-    print("==> 校验补丁结果（v3.6 防静默失配检查，含常驻被控/开机自启六项）")
+    print("==> 校验补丁结果（v3.7 防静默失配检查，含固定密码/退出锁屏/常驻被控）")
 
     critical_errors = []
     warn_errors = []
@@ -331,6 +440,28 @@ def verify_patches(rs_root, hbb_root=None, server="", key=""):
                     f"[{label}] 预期移除但仍存在: {pattern}")
 
     # ---- CRITICAL：本次两项修复 + 服务器/KEY ----
+    # ---- CRITICAL：v3.7 两项修复 ----
+    check("CRIT-v3.7 custom.txt 纯 JSON 回退 (src/common.rs)",
+          os.path.join(rs_root, "src", "common.rs"), [
+              # 回退解析生效标志
+              (r'parsed = serde_json::from_str\(config\)\.ok\(\);', True),
+              # 官方签名路径已改写（不再是无条件 return 的验签失败分支）
+              (r'let Ok\(data\) = sign::verify\(&data, &pk\) else', False),
+          ])
+    lock_paths = [
+        os.path.join(rs_root, "src", "server", "connection.rs"),
+        os.path.join(rs_root, "src", "connection.rs"),
+    ]
+    lock_found = [p for p in lock_paths if p and os.path.exists(p)]
+    if lock_found:
+        check("CRIT-v3.7 被控端忽略退出锁屏 (server/connection.rs)",
+              lock_found[0], [
+                  (r'self\.lock_after_session_end = false;', True),
+                  (r'self\.lock_after_session_end = q == BoolOption::Yes;', False),
+              ])
+    else:
+        critical_errors.append(
+            "[CRIT-v3.7 被控端忽略退出锁屏] src/server/connection.rs 与 src/connection.rs 均不存在")
     check("CRIT-问题2 托盘无条件拉起 (src/core_main.rs)",
           os.path.join(rs_root, "src", "core_main.rs"), [
               (r'check_process\("--server", false\) && !crate::check_process\("--tray"', False),
@@ -510,6 +641,53 @@ def selftest():
                 '    }\n'
                 '}\n'
             )
+        # v3.7 P1 样例：src/common.rs —— read_custom_client 官方原文本
+        # （1.3.9 与 master 逐字一致；仅前半段被补丁替换）
+        with open(os.path.join(rs_src, "common.rs"), "w", encoding="utf-8") as f:
+            f.write(
+                'pub fn read_custom_client(config: &str) {\n'
+                '    let Ok(data) = decode64(config) else {\n'
+                '        log::error!("Failed to decode custom client config");\n'
+                '        return;\n'
+                '    };\n'
+                '    const KEY: &str = "5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM=";\n'
+                '    let Some(pk) = get_rs_pk(KEY) else {\n'
+                '        log::error!("Failed to parse public key of custom client");\n'
+                '        return;\n'
+                '    };\n'
+                '    let Ok(data) = sign::verify(&data, &pk) else {\n'
+                '        log::error!("Failed to dec custom client config");\n'
+                '        return;\n'
+                '    };\n'
+                '    let Ok(mut data) =\n'
+                '        serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&data)\n'
+                '    else {\n'
+                '        log::error!("Failed to parse custom client config");\n'
+                '        return;\n'
+                '    };\n'
+                '    if let Some(app_name) = data.remove("app-name") {\n'
+                '        config::HARD_SETTINGS.write().unwrap().insert("x", "y");\n'
+                '    }\n'
+                '}\n'
+            )
+        # v3.7 P2 样例：src/server/connection.rs —— lock_after_session_end 块
+        # （master 路径；1.3.9 在 src/connection.rs，文本一致）
+        sc = os.path.join(rs_src, "server")
+        os.makedirs(sc)
+        with open(os.path.join(sc, "connection.rs"), "w", encoding="utf-8") as f:
+            f.write(
+                'fn update_option(o: &OptionMessage) {\n'
+                '        if let Some(q) = o.supported_decoding.clone().take() {\n'
+                '        }\n'
+                '        if let Ok(q) = o.lock_after_session_end.enum_value() {\n'
+                '            if q != BoolOption::NotSet {\n'
+                '                self.lock_after_session_end = q == BoolOption::Yes;\n'
+                '            }\n'
+                '        }\n'
+                '        if let Ok(q) = o.show_remote_cursor.enum_value() {\n'
+                '        }\n'
+                '}\n'
+            )
         # desktop_setting_page.dart
         pages = os.path.join(tmp, "rs", "flutter", "lib", "desktop", "pages")
         os.makedirs(pages)
@@ -662,6 +840,18 @@ def selftest():
         assert 'CurrentVersion\\\\Run' in cm, "P2 注册表 Run 路径缺失"
         assert 'hkcu.create_subkey' in cm, "P2 create_subkey 缺失"
 
+        # v3.7 P1：custom.txt 纯 JSON 回退
+        cmn = open(os.path.join(rs_src, "common.rs"), encoding="utf-8").read()
+        assert 'parsed = serde_json::from_str(config).ok();' in cmn, "v3.7 P1 纯 JSON 回退缺失"
+        assert 'if parsed.is_none()' in cmn, "v3.7 P1 回退分支缺失"
+        assert 'sign::verify(&data, &pk) else' not in cmn, "v3.7 P1 官方验签硬失败分支未替换"
+        assert 'data.remove("app-name")' in cmn, "v3.7 P1 补丁误伤函数后半段"
+        # v3.7 P2：被控端忽略退出锁屏
+        scn = open(os.path.join(sc, "connection.rs"), encoding="utf-8").read()
+        assert 'self.lock_after_session_end = false;' in scn, "v3.7 P2 锁屏忽略缺失"
+        assert 'q == BoolOption::Yes' not in scn, "v3.7 P2 原锁屏赋值残留"
+        assert 'show_remote_cursor.enum_value()' in scn, "v3.7 P2 误伤相邻选项块"
+
         dsp = open(os.path.join(pages, "desktop_setting_page.dart"), encoding="utf-8").read()
         assert '// SettingsTabKey.network,  (hidden by custom build)' in dsp, "网络页签隐藏失败"
         assert '// SettingsTabKey.safety,  (hidden by custom build)' in dsp, "安全页签隐藏失败"
@@ -705,7 +895,7 @@ def selftest():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="RustDesk Windows 定制补丁 v3.5")
+    ap = argparse.ArgumentParser(description="RustDesk Windows 定制补丁 v3.7")
     ap.add_argument("target", choices=["all", "hbb", "rustdesk", "selftest"])
     ap.add_argument("--path", default=".")
     ap.add_argument("--server", default="")

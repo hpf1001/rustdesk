@@ -1,0 +1,11 @@
+{
+  "password": "00Y+DOnj9C9GWm1hm454KrzmjCx2bceaWSPTDDHQusdcA=",
+  "salt": "rustdesk-custom-preset-salt",
+  "override-settings": {
+    "verification-method": "use-permanent-password",
+    "approve-mode": "password",
+    "direct-server": "Y",
+    "access-mode": "full",
+    "enable-check-update": "N"
+  }
+}
